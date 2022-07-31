@@ -6,15 +6,54 @@ import yfinance as yf
 from yahoo_fin import stock_info
 from datetime import datetime, timedelta
 import schedule
+from tinkoff.invest import Client
+import configparser
+
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+TOKEN = config['DEFAULT']['tinkoff_token']
 
 gc = gspread.service_account(filename='service_account.json')
 
-cmc = CoinMarketCapAPI('')
+cmc = CoinMarketCapAPI(config['DEFAULT']['cmc'])
 
-sh = gc.open_by_url(
-    'https://docs.google.com/spreadsheets/d/1a4Dxxxxxxxxxxxxxxxxxxxxxxxx/')
+sh = gc.open_by_url(config['DEFAULT']['gsheets'])
 
 worksheet = sh.worksheet("Статистика (заполняем тут)")
+
+
+def get_instruments(tickers, i_type):
+    try:
+        with Client(TOKEN) as client:
+            if i_type == 'shares':
+                instruments = client.instruments.shares()
+            elif i_type == 'etfs':
+                instruments = client.instruments.etfs()
+            elif i_type == 'currencies':
+                instruments = client.instruments.currencies()
+        figis_tickers = {}
+        for instrument in instruments.instruments:
+            if instrument.ticker in tickers:
+                figis_tickers[instrument.figi] = instrument.ticker
+        return figis_tickers
+    except Exception as e:
+        print(e)
+        return {}
+
+def get_tinkoff_last_prices(figis_tickers):
+    try:
+        with Client(TOKEN) as client:
+            last_prices = client.market_data.get_last_prices(figi=figis_tickers.keys())
+        tickers_prices = {}
+        for share in last_prices.last_prices:
+            rubles = share.price.units
+            cops = f'{"000000000"[:-len(str(share.price.nano))]}{share.price.nano}'
+            tickers_prices[f'{figis_tickers[share.figi]}.ME'] = float(f'{rubles}.{cops}')
+        return tickers_prices
+    except Exception as e:
+        print(e)
+        return {}
 
 
 def get_cryptoinfo(list_of_crypto):
@@ -66,11 +105,16 @@ def get_table(worksheet):
     return df
 
 
-def get_tickers_from_table(df, type_str):
+def get_tickers_from_table(df, type_str, moex=False):
     list_tickets = []
     for index, row in df.iterrows():
         if row['Криптовалюта/акции'] == type_str and row['Закрыта ли сделка'] == 'нет':
-            list_tickets.append(row['Название инструмента'])
+            if moex:
+                if '.ME' in row['Название инструмента']:
+                    list_tickets.append(row['Название инструмента'][:row['Название инструмента'].find('.ME')])
+            else:
+                if not '.ME' in row['Название инструмента']:
+                    list_tickets.append(row['Название инструмента'])
     return list(set(list_tickets))
 
 
@@ -121,21 +165,48 @@ def do_all():
     df_raw = get_table(worksheet)
     df = df_raw[['Криптовалюта/акции', 'Название инструмента', 'Закрыта ли сделка',
                  'Валюта базового инструмента (руб/USD/BTC или другое)']]
+
+    all_info = {}
+
     list_cryptos = get_tickers_from_table(df, 'Криптовалюта')
     list_stocks = get_tickers_from_table(df, 'Акции')
-    info_stocks = get_stocks(list_stocks)
+    list_etfs = get_tickers_from_table(df, 'ETF')
+    list_currencies = get_tickers_from_table(df, 'Валюта')
+    list_stocks_moex = get_tickers_from_table(df, 'Акции', True)
+    list_etfs_moex = get_tickers_from_table(df, 'ETF', True)
+    list_currencies_moex = get_tickers_from_table(df, 'Валюта', True)
+
+    if len(list_stocks_moex) > 0:
+        figis_tickers = get_instruments(list_stocks_moex, 'shares')
+        info = get_tinkoff_last_prices(figis_tickers)
+        all_info |= info
+    if len(list_etfs_moex) > 0:
+        figis_tickers = get_instruments(list_etfs_moex, 'etfs')
+        info = get_tinkoff_last_prices(figis_tickers)
+        all_info |= info
+    if len(list_currencies_moex) > 0:
+        figis_tickers = get_instruments(list_currencies_moex, 'currencies')
+        info = get_tinkoff_last_prices(figis_tickers)
+        all_info |= info
+
     info_crypto = get_cryptoinfo(list_cryptos)
-    all_info = info_stocks | info_crypto
+    all_info |= info_crypto
+
+    for l in [list_stocks, list_etfs, list_currencies]:
+        if len(l) > 0:
+            info = get_stocks(l)
+            all_info |= info
+
     new_df = refresh_data_in_table(df_raw, all_info)
     new_df.drop(new_df.columns[15:], axis=1, inplace=True)
     worksheet.update([new_df.columns.values.tolist()] + new_df.values.tolist())
     print('[WORK DONE]')
-    print(f'[NEXT RUN IN {datetime.now()+timedelta(minutes=30)}]')
+    print(f'[NEXT RUN IN {datetime.now()+timedelta(minutes=int(config["DEFAULT"]["timeout"]))}]')
 
 
 def main():
     do_all()
-    schedule.every(30).minutes.do(do_all)
+    schedule.every(int(config['DEFAULT']['timeout'])).minutes.do(do_all)
     while 1:
         schedule.run_pending()
         time.sleep(1)
